@@ -9,13 +9,14 @@
 #include "../PrintConfig.hpp"
 #include "../Semver.hpp"
 #include "../Time.hpp"
+#include "BBConfig.hpp"
 
 #include "../I18N.hpp"
 
 #include "3mf.hpp"
-
 #include <limits>
 #include <stdexcept>
+#include <filesystem>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -53,6 +54,7 @@ const unsigned int VERSION_3MF = 1;
 // Allow loading version 2 file as well.
 const unsigned int VERSION_3MF_COMPATIBLE = 2;
 const char* SLIC3RPE_3MF_VERSION = "slic3rpe:Version3mf"; // definition of the metadata name saved into .model file
+const char* BB_3MF_VERSION = "BambuStudio:3mfVersion"; // definition of the metadata name saved into .model file
 
 // Painting gizmos data version numbers
 // 0 : 3MF files saved by older PrusaSlicer or the painting gizmo wasn't used. No version definition in them.
@@ -71,19 +73,30 @@ const std::string MODEL_FILE = "3D/3dmodel.model"; // << this is the only format
 const std::string CONTENT_TYPES_FILE = "[Content_Types].xml";
 const std::string RELATIONSHIPS_FILE = "_rels/.rels";
 const std::string THUMBNAIL_FILE = "Metadata/thumbnail.png";
-const std::string SLIC3R_PRINT_CONFIG_FILE = "Metadata/Slic3r.config";
-const std::string SLIC3R_MODEL_CONFIG_FILE = "Metadata/Slic3r_model.config";
-const std::string SLIC3R_LAYER_CONFIG_RANGES_FILE = "Metadata/Slic3r_layer_config_ranges.xml";
-const std::string SUPER_PRINT_CONFIG_FILE = "Metadata/SuperSlicer.config";
-const std::string SUPER_MODEL_CONFIG_FILE = "Metadata/SuperSlicer_model.config";
-const std::string SUPER_LAYER_CONFIG_RANGES_FILE = "Metadata/SuperSlicer_layer_config_ranges.xml";
-const std::string PRUSA_PRINT_CONFIG_FILE = "Metadata/Slic3r_PE.config";
-const std::string PRUSA_MODEL_CONFIG_FILE = "Metadata/Slic3r_PE_model.config";
-const std::string PRUSA_LAYER_CONFIG_RANGES_FILE = "Metadata/Prusa_Slicer_layer_config_ranges.xml";
+
+bool isdebug_3mf = false;
+const std::string SLIC3R_PRINT_CONFIG_FILE = "Metadata/Slic3r.config"; // gcode-style
+const std::string SUPER_PRINT_CONFIG_FILE = "Metadata/SuperSlicer.config"; // gcode-style
+const std::string PRUSA_PRINT_CONFIG_FILE = "Metadata/Slic3r_PE.config"; // gcode-style
+const std::string BBS_PROJECT_CONFIG_FILE = "Metadata/project_settings.config"; // json
+
+const std::string SLIC3R_MODEL_CONFIG_FILE = "Metadata/Slic3r_model.config"; // xml
+const std::string SUPER_MODEL_CONFIG_FILE = "Metadata/SuperSlicer_model.config"; // xml
+const std::string PRUSA_MODEL_CONFIG_FILE = "Metadata/Slic3r_PE_model.config"; // xml
+const std::string BBS_MODEL_CONFIG_FILE = "Metadata/model_settings.config"; // xml
+
+const std::string SLIC3R_LAYER_CONFIG_RANGES_FILE = "Metadata/Slic3r_layer_config_ranges.xml"; // xml
+const std::string SUPER_LAYER_CONFIG_RANGES_FILE = "Metadata/SuperSlicer_layer_config_ranges.xml"; // xml
+const std::string PRUSA_LAYER_CONFIG_RANGES_FILE = "Metadata/Prusa_Slicer_layer_config_ranges.xml"; // xml
+const std::string BBS_LAYER_CONFIG_RANGES_FILE = "Metadata/layer_config_ranges.xml"; // xml
+
 const std::string LAYER_HEIGHTS_PROFILE_FILE = "Metadata/Slic3r_PE_layer_heights_profile.txt";
+
 const std::string SLA_SUPPORT_POINTS_FILE = "Metadata/Slic3r_PE_sla_support_points.txt";
 const std::string SLA_DRAIN_HOLES_FILE = "Metadata/Slic3r_PE_sla_drain_holes.txt";
-const std::string CUSTOM_GCODE_PER_PRINT_Z_FILE = "Metadata/Prusa_Slicer_custom_gcode_per_print_z.xml";
+
+const std::string CUSTOM_GCODE_PER_PRINT_Z_FILE = "Metadata/Prusa_Slicer_custom_gcode_per_print_z.xml";  // xml
+
 
 static constexpr const char* MODEL_TAG = "model";
 static constexpr const char* RESOURCES_TAG = "resources";
@@ -98,6 +111,11 @@ static constexpr const char* COMPONENT_TAG = "component";
 static constexpr const char* BUILD_TAG = "build";
 static constexpr const char* ITEM_TAG = "item";
 static constexpr const char* METADATA_TAG = "metadata";
+
+static constexpr const char* BB_PLATE_TAG = "plate";
+static constexpr const char* BB_MODEL_INSTANCE_TAG = "model_instance";
+static constexpr const char* BB_ASSEMBLE_TAG = "assemble";
+static constexpr const char* BB_ASSEMBLE_ITEM_TAG = "assemble_item";
 
 static constexpr const char* CONFIG_TAG = "config";
 static constexpr const char* VOLUME_TAG = "volume";
@@ -169,6 +187,12 @@ public:
     version_error(const char* what_arg) : Slic3r::FileIOError(what_arg) {}
 };
 
+class bambu_version_error : public version_error
+{
+public:
+    bambu_version_error(const std::string& what_arg) : version_error(what_arg) {}
+    bambu_version_error(const char* what_arg) : version_error(what_arg) {}
+};
 const char* get_attribute_value_charptr(const char** attributes, unsigned int attributes_size, const char* attribute_key)
 {
     if ((attributes == nullptr) || (attributes_size == 0) || (attributes_size % 2 != 0) || (attribute_key == nullptr))
@@ -426,6 +450,7 @@ namespace Slic3r {
         // Version of the 3mf file
         unsigned int m_version;
         bool m_check_version;
+        bool m_is_bambu = false;
 
         // Semantic version of PrusaSlicer, that generated this 3MF.
         boost::optional<Semver> m_prusaslicer_generator_version;
@@ -476,6 +501,7 @@ namespace Slic3r {
                 XML_ErrorString(XML_GetErrorCode(m_xml_parser));
         }
 
+        std::filesystem::path extract_file(Model &model, mz_zip_archive &archive, mz_zip_archive_file_stat &stat);
         bool _load_model_from_file(const std::string& filename, Model& model, DynamicPrintConfig& config, ConfigSubstitutionContext& config_substitutions);
         bool _extract_model_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
         void _extract_layer_heights_profile_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
@@ -554,6 +580,16 @@ namespace Slic3r {
         bool _handle_start_config_metadata(const char** attributes, unsigned int num_attributes);
         bool _handle_end_config_metadata();
 
+        //BB
+        bool _handle_start_plate(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_plate();
+        bool _handle_start_model_instance(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_model_instance();
+        bool _handle_start_assemble(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_assemble();
+        bool _handle_start_assemble_item(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_assemble_item();
+
         bool _generate_volumes(ModelObject& object, const Geometry& geometry, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions, DynamicPrintConfig& config_not_used_remove_plz);
 
         // callbacks to parse the .model file
@@ -628,8 +664,30 @@ namespace Slic3r {
         XML_StopParser(m_xml_parser, false);
     }
 
+
+
+    std::filesystem::path _3MF_Importer::extract_file(Model &model, mz_zip_archive &archive, mz_zip_archive_file_stat &stat)
+    {
+        std::filesystem::path temp_path  = std::filesystem::temp_directory_path();
+        std::string             model_name = "";
+        for (const ModelObject *model_object : model.objects) {
+            model_name = model_object->get_export_filename();
+            if (!model_name.empty()) {
+                break;
+            }
+        }
+        temp_path   = temp_path / (model_name + std::string("_temp_conf.config"));
+        mz_bool res = mz_zip_reader_extract_to_file(&archive, stat.m_file_index, temp_path.string().c_str(), 0);
+        if (res == 0) {
+            add_error("Error while extract project config file to temp file");
+            return "";
+        }
+        return temp_path;
+    }
+    
     bool _3MF_Importer::_load_model_from_file(const std::string& filename, Model& model, DynamicPrintConfig& config, ConfigSubstitutionContext& config_substitutions)
     {
+                            isdebug_3mf = false;
         mz_zip_archive archive;
         mz_zip_zero_struct(&archive);
 
@@ -659,6 +717,11 @@ namespace Slic3r {
                             add_error("Archive does not contain a valid model");
                             return false;
                         }
+                    } catch (const bambu_version_error &e) {
+                        // ensure the zip archive is closed and rethrow the exception
+                        close_zip_reader(&archive);
+                        //TODO try to parse it with bambu parser
+                        throw Slic3r::FileIOError(e.what());
                     }
                     catch (const std::exception& e)
                     {
@@ -769,16 +832,66 @@ namespace Slic3r {
             return true;
         };
         bool use_prusa_config = false;
-        if (!print_config_parsed)
+        if (!print_config_parsed) {
             if (!read_from_other_storage(SUPER_PRINT_CONFIG_FILE, SUPER_MODEL_CONFIG_FILE, SUPER_LAYER_CONFIG_RANGES_FILE, false))
                 return false;
-        if (!print_config_parsed)
+        }
+        if (!print_config_parsed) {
             if (!read_from_other_storage(PRUSA_PRINT_CONFIG_FILE, PRUSA_MODEL_CONFIG_FILE, PRUSA_LAYER_CONFIG_RANGES_FILE, true))
                 return false;
-            else {
+            if (print_config_parsed) {
+                //succeed to read prusa
                 use_prusa_config = true;
-                config.convert_from_prusa();
+                config.convert_from_prusa(true);
             }
+        }
+        if (!print_config_parsed) {
+            if (m_is_bambu) {
+                for (mz_uint i = 0; i < num_entries; ++i) {
+                    if (mz_zip_reader_file_stat(&archive, i, &stat)) {
+                        std::string name(stat.m_filename);
+                        std::replace(name.begin(), name.end(), '\\', '/');
+                        if (boost::algorithm::iequals(name, BBS_PROJECT_CONFIG_FILE)) {
+                            //extract to temp file
+                            std::filesystem::path temp_file = extract_file(model, archive, stat);
+                            bool ok = read_project_file_bambu(temp_file, config, config_substitutions, true);
+                            if (!ok) {
+                                add_error("Error load config from bambu/orca json");
+                                close_zip_reader(&archive);
+                                return false;
+                            }
+                            print_config_parsed = true;
+                        } 
+                        //else if (boost::algorithm::iequals(name, BBS_MODEL_CONFIG_FILE)) {
+                        //    // extract slic3r model config file
+                        //    isdebug_3mf = true;
+                        //    if (!_extract_model_config_from_archive(archive, stat, model)) {
+                        //        close_zip_reader(&archive);
+                        //        add_error("Archive does not contain a valid model config");
+                        //        return false;
+                        //    }
+                        //    // extract to temp file
+                        //    // std::filesystem::path temp_file = extract_file(model, archive, stat);
+                        //    // bool ok = read_project_file_bambu(temp_file, config, config_substitutions, false);
+                        //    // if(!ok)
+                        //    //    add_error("Error load config from bambu/orca json");
+                        //} else if (boost::algorithm::iequals(name, BBS_LAYER_CONFIG_RANGES_FILE)) {
+                        //    // extract slic3r model config file
+                        //    if (!_extract_model_config_from_archive(archive, stat, model)) {
+                        //        close_zip_reader(&archive);
+                        //        add_error("Archive does not contain a valid layer config");
+                        //        return false;
+                        //    }
+                        //    // extract to temp file
+                        //    // std::filesystem::path temp_file = extract_file(model, archive, stat);
+                        //    // bool ok = read_project_file_bambu(temp_file, config, config_substitutions, false);
+                        //    // if(!ok)
+                        //    //    add_error("Error load config from bambu/orca json");
+                        //}
+                    }
+                }
+            }
+        }
 
         close_zip_reader(&archive);
 
@@ -827,12 +940,12 @@ namespace Slic3r {
             }
         }
 
-        for (const IdToModelObjectMap::value_type& object : m_objects) {
+        for (const IdToModelObjectMap::value_type &object : m_objects) {
             if (object.second >= int(m_model->objects.size())) {
                 add_error("Unable to find object");
                 return false;
             }
-            ModelObject* model_object = m_model->objects[object.second];
+            ModelObject *                   model_object = m_model->objects[object.second];
             IdToGeometryMap::const_iterator obj_geometry = m_geometries.find(object.first);
             if (obj_geometry == m_geometries.end()) {
                 add_error("Unable to find object geometry");
@@ -840,7 +953,8 @@ namespace Slic3r {
             }
 
             // m_layer_heights_profiles are indexed by a 1 based model object index.
-            IdToLayerHeightsProfileMap::iterator obj_layer_heights_profile = m_layer_heights_profiles.find(object.second + 1);
+            IdToLayerHeightsProfileMap::iterator obj_layer_heights_profile = m_layer_heights_profiles.find(
+                object.second + 1);
             if (obj_layer_heights_profile != m_layer_heights_profiles.end())
                 model_object->layer_height_profile.set(std::move(obj_layer_heights_profile->second));
 
@@ -853,7 +967,7 @@ namespace Slic3r {
             IdToSlaSupportPointsMap::iterator obj_sla_support_points = m_sla_support_points.find(object.second + 1);
             if (obj_sla_support_points != m_sla_support_points.end() && !obj_sla_support_points->second.empty()) {
                 model_object->sla_support_points = std::move(obj_sla_support_points->second);
-                model_object->sla_points_status = sla::PointsStatus::UserModified;
+                model_object->sla_points_status  = sla::PointsStatus::UserModified;
             }
 
             IdToSlaDrainHolesMap::iterator obj_drain_holes = m_sla_drain_holes.find(object.second + 1);
@@ -861,29 +975,39 @@ namespace Slic3r {
                 model_object->sla_drain_holes = std::move(obj_drain_holes->second);
             }
 
-            ObjectMetadata::VolumeMetadataList volumes;
-            ObjectMetadata::VolumeMetadataList* volumes_ptr = nullptr;
+            ObjectMetadata::VolumeMetadataList  volumes;
+            ObjectMetadata::VolumeMetadataList *volumes_ptr = nullptr;
 
             IdToMetadataMap::iterator obj_metadata = m_objects_metadata.find(object.first);
             if (obj_metadata != m_objects_metadata.end()) {
                 // config data has been found, this model was saved using slic3r pe
 
                 // apply object's name and config data
-                for (const Metadata& metadata : obj_metadata->second.metadata) {
-                    if (metadata.key == "name")
-                        model_object->name = metadata.value;
-                    else
-                        model_object->config.set_deserialize(metadata.key, metadata.value, config_substitutions);
+                if (!m_is_bambu) {
+                    for (const Metadata &metadata : obj_metadata->second.metadata) {
+                        if (metadata.key == "name")
+                            model_object->name = metadata.value;
+                        else
+                            model_object->config.set_deserialize(metadata.key, metadata.value, config_substitutions);
+                    }
+                } else {
+                    std::map<std::string,std::string> key_2_value;
+                    for (const Metadata &metadata : obj_metadata->second.metadata) {
+                        if (metadata.key == "name")
+                            model_object->name = metadata.value;
+                        else
+                            key_2_value[metadata.key] = metadata.value;
+                    }
+                    convert_settings_from_bambu(key_2_value, config, model_object->config, config_substitutions, false);
                 }
 
                 // select object's detected volumes
                 volumes_ptr = &obj_metadata->second.volumes;
-            }
-            else {
+            } else {
                 // config data not found, this model was not saved using slic3r pe
 
                 // add the entire geometry as the single volume to generate
-                volumes.emplace_back(0, (int)obj_geometry->second.triangles.size() - 1);
+                volumes.emplace_back(0, (int) obj_geometry->second.triangles.size() - 1);
 
                 // select as volumes
                 volumes_ptr = &volumes;
@@ -892,14 +1016,14 @@ namespace Slic3r {
             if (!_generate_volumes(*model_object, obj_geometry->second, *volumes_ptr, config_substitutions, config))
                 return false;
 
-            if (use_prusa_config) {
-                model_object->config.convert_from_prusa(config);
-                for (ModelVolume* volume : model_object->volumes)
-                    volume->config.convert_from_prusa(config);
+            if (use_prusa_config)
+                model_object->config.convert_from_prusa(config, false);
+            if (use_prusa_config || m_is_bambu) {
+                for (ModelVolume *volume : model_object->volumes)
+                    volume->config.convert_from_prusa(config, false);
                 for (auto entry : model_object->layer_config_ranges)
-                    entry.second.convert_from_prusa(config);
+                    entry.second.convert_from_prusa(config, false);
             }
-
         }
 
         int object_idx = 0;
@@ -955,12 +1079,17 @@ namespace Slic3r {
         CallbackData data(m_xml_parser, *this, stat);
 
         mz_bool res = 0;
-
         try
         {
             res = mz_zip_reader_extract_file_to_callback(&archive, stat.m_filename, [](void* pOpaque, mz_uint64 file_ofs, const void* pBuf, size_t n)->size_t {
                 CallbackData* data = (CallbackData*)pOpaque;
                 if (!XML_Parse(data->parser, (const char*)pBuf, (int)n, (file_ofs + n == data->stat.m_uncomp_size) ? 1 : 0) || data->importer.parse_error()) {
+                    if (data->importer.m_is_bambu) {
+                        const std::string msg = "The selected 3mf file has been saved with BaumbuStudio/OrcaSlicer and is not compatible."
+                            "\nTry generating a project file via export -> Export Generic 3MF on your Bambu/orca software."
+                            "\nNote: Modifiers meshes and layers aren't supported yet.";
+                        throw bambu_version_error(msg);
+                    }
                     char error_buf[1024];
                     ::sprintf(error_buf, "Error (%s) while parsing '%s' at line %d", data->importer.parse_error_message(), data->stat.m_filename, (int)XML_GetCurrentLineNumber(data->parser));
                     throw Slic3r::FileIOError(error_buf);
@@ -969,10 +1098,15 @@ namespace Slic3r {
                 return n;
                 }, &data, 0);
         }
+        catch (const bambu_version_error& e)
+        {
+            // rethrow the exception
+            throw e;
+        }
         catch (const version_error& e)
         {
             // rethrow the exception
-            throw Slic3r::FileIOError(e.what());
+            throw e;
         }
         catch (std::exception& e)
         {
@@ -1440,6 +1574,14 @@ namespace Slic3r {
             res = _handle_start_item(attributes, num_attributes);
         else if (::strcmp(METADATA_TAG, name) == 0)
             res = _handle_start_metadata(attributes, num_attributes);
+        else if (::strcmp(BB_PLATE_TAG, name) == 0)
+            res = _handle_start_plate(attributes, num_attributes);
+        else if (::strcmp(BB_MODEL_INSTANCE_TAG, name) == 0)
+            res = _handle_start_model_instance(attributes, num_attributes);
+        else if (::strcmp(BB_ASSEMBLE_TAG, name) == 0)
+            res = _handle_start_assemble(attributes, num_attributes);
+        else if (::strcmp(BB_ASSEMBLE_ITEM_TAG, name) == 0)
+            res = _handle_start_assemble_item(attributes, num_attributes);
 
         if (!res)
             _stop_xml_parser();
@@ -1478,6 +1620,14 @@ namespace Slic3r {
             res = _handle_end_item();
         else if (::strcmp(METADATA_TAG, name) == 0)
             res = _handle_end_metadata();
+        else if (::strcmp(BB_PLATE_TAG, name) == 0)
+            res = _handle_end_plate();
+        else if (::strcmp(BB_MODEL_INSTANCE_TAG, name) == 0)
+            res = _handle_end_model_instance();
+        else if (::strcmp(BB_ASSEMBLE_TAG, name) == 0)
+            res = _handle_end_assemble();
+        else if (::strcmp(BB_ASSEMBLE_ITEM_TAG, name) == 0)
+            res = _handle_end_assemble_item();
 
         if (!res)
             _stop_xml_parser();
@@ -1830,6 +1980,8 @@ namespace Slic3r {
                 const std::string msg = (boost::format("The selected 3mf file has been saved with a newer version of %1% and is not compatible.") % std::string(SLIC3R_APP_NAME)).str();
                 throw version_error(msg);
             }
+        } else if (m_curr_metadata_name == BB_3MF_VERSION) {
+            m_is_bambu = true;
         } else if (m_curr_metadata_name == "Application") {
             // Generator application of the 3MF.
             // SLIC3R_APP_KEY - SLIC3R_VERSION
@@ -1849,6 +2001,50 @@ namespace Slic3r {
                 _(L("The selected 3MF contains multi-material painted object using a newer version of PrusaSlicer and is not compatible.")));
         }
 
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_plate(const char **attributes, unsigned int num_attributes)
+    {
+        // not parsed yet
+        return true;
+    }
+    bool _3MF_Importer::_handle_end_plate()
+    {
+        // not parsed yet
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_model_instance(const char **attributes, unsigned int num_attributes)
+    {
+        // not parsed yet
+        return true;
+    }
+    bool _3MF_Importer::_handle_end_model_instance()
+    {
+        // not parsed yet
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_assemble(const char **attributes, unsigned int num_attributes)
+    {
+        // not parsed yet
+        return true;
+    }
+    bool _3MF_Importer::_handle_end_assemble()
+    {
+        // not parsed yet
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_assemble_item(const char **attributes, unsigned int num_attributes)
+    {
+        // not parsed yet
+        return true;
+    }
+    bool _3MF_Importer::_handle_end_assemble_item()
+    {
+        // not parsed yet
         return true;
     }
 
