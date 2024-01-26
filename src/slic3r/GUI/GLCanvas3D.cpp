@@ -3139,7 +3139,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         m_dirty = true;
     };
 
-    auto* app_config = GUI::wxGetApp().app_config;
+    auto* app_config = GUI::wxGetApp().app_config.get();
     bool focus_platter_on_mouse = app_config->get("focus_platter_on_mouse") == "1";
     if (m_gizmos.on_mouse(evt)) {
         if (focus_platter_on_mouse) {
